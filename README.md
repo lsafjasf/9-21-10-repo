@@ -8,6 +8,7 @@ Only the Python standard library is required.
 - `collab_text.py` — library implementation and public API.
 - `test_collab_text.py` — deterministic edge-case self-tests.
 - `random_differential_test.py` — randomized differential tests.
+- `sync_diagnostics.py` — reproducible sync-diagnostics demo and verification.
 
 ## Model
 
@@ -59,11 +60,42 @@ dominates the current version. It refuses concurrent snapshots because a
 GC'd snapshot does not contain enough deleted-history information to perform
 a three-way merge.
 
+## Sync Diagnostics
+
+The causal buffer is observable. Construct a replica with
+`Document(site, diagnostics=True)` and it records a `SyncDiagnostics` trace
+on `doc.diagnostics`:
+
+- `received` — how many operations this replica was offered;
+- `pending` events — each buffered operation plus the exact predecessors it
+  waits for (`waiting_for`), with `redelivered` marking duplicates that
+  arrived while already buffered;
+- `skipped` events — duplicate deliveries with the identification basis:
+  the version-vector entry (`vv_seq`) that already covers the operation's
+  `op_seq`;
+- `applied` events — `via=direct` or `via=drain` (replayed from the buffer
+  once predecessors arrived).
+
+`diag.verify(doc)` asserts the diagnostics agree with the final state: the
+recorded applied operations replay to exactly `doc.text`, and the recorded
+pending set matches the live causal buffer. `diag.report()` renders a
+deterministic text trace; recording is a pure function of the delivery
+order, so replaying the same order (fixed seed) yields identical reports.
+Diagnostics default to off and never change merge results.
+
+```powershell
+python sync_diagnostics.py --seed 7 --steps 40
+```
+
+The script asserts report reproducibility across runs, diagnostics/text
+consistency per replica, and identical convergence with diagnostics off.
+
 ## Self-tests
 
 ```powershell
 python test_collab_text.py
 python random_differential_test.py
+python sync_diagnostics.py
 ```
 
 Run several reproducible randomized cases:

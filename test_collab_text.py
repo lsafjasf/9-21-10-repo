@@ -7,10 +7,12 @@ import unittest
 from typing import Tuple
 
 import json
+import random
 from collab_text import (
     MIN_POS,
     MAX_POS,
     Document,
+    SyncDiagnostics,
     allocate_between,
     compare_positions,
 )
@@ -216,6 +218,122 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(alpha.tombstones, ())
         self.assertEqual(len(snapshot["chars"]), 3)
         self.assertEqual(len(alpha), 3)
+
+
+class DiagnosticsTests(unittest.TestCase):
+    def test_pending_records_waiting_predecessors(self) -> None:
+        alpha, bravo, charlie, base = make_base()
+        first = bravo.local_insert(3, "X")
+        second = bravo.local_insert(4, "Y")
+
+        observer = Document("obs", diagnostics=True)
+        observer.merge([base, second])
+        diag = observer.diagnostics
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag.received, 2)
+        self.assertEqual(diag.pending_count, 1)
+        self.assertEqual(diag.currently_pending(), {(2, "b"): {"b": 1}})
+        pending_events = [e for e in diag.events if e["event"] == "pending"]
+        self.assertEqual(pending_events[0]["waiting_for"], {"b": 1})
+
+        observer.apply(first)
+        self.assertEqual(diag.pending_count, 0)
+        self.assertEqual(diag.applied_count, 3)
+        drained = [e for e in diag.events if e["event"] == "applied" and e["via"] == "drain"]
+        self.assertEqual([e["op"] for e in drained], [(2, "b")])
+        diag.verify(observer)
+
+    def test_duplicate_delivery_records_version_vector_basis(self) -> None:
+        alpha, bravo, _, base = make_base()
+        op = bravo.local_insert(1, "X")
+
+        observer = Document("obs", diagnostics=True)
+        observer.merge([base, op, op])
+        diag = observer.diagnostics
+        self.assertEqual(diag.received, 3)
+        self.assertEqual(diag.skipped_count, 1)
+        skipped = [e for e in diag.events if e["event"] == "skipped"][0]
+        self.assertEqual(skipped["op"], (1, "b"))
+        self.assertEqual(
+            skipped["basis"],
+            {"kind": "already_applied", "site": "b", "op_seq": 1, "vv_seq": 1},
+        )
+        self.assertGreaterEqual(skipped["basis"]["vv_seq"], skipped["basis"]["op_seq"])
+        diag.verify(observer)
+
+    def test_duplicate_while_buffered_is_flagged_redelivered(self) -> None:
+        alpha = Document("a")
+        first = alpha.local_insert(0, "x")
+        second = alpha.local_insert(1, "y")
+
+        observer = Document("obs", diagnostics=True)
+        observer.apply(second)
+        observer.apply(second)
+        diag = observer.diagnostics
+        pendings = [e for e in diag.events if e["event"] == "pending"]
+        self.assertEqual(len(pendings), 2)
+        self.assertFalse(pendings[0]["redelivered"])
+        self.assertTrue(pendings[1]["redelivered"])
+        self.assertEqual(diag.pending_count, 1)
+
+        observer.apply(first)
+        self.assertEqual(observer.text, "xy")
+        diag.verify(observer)
+
+    def test_diagnostics_replay_matches_final_text(self) -> None:
+        alpha, bravo, charlie, base = make_base()
+        ops = [
+            alpha.local_insert(3, "!"),
+            bravo.local_insert(0, "<"),
+            charlie.local_delete(1, 2),
+            alpha.local_insert(0, "["),
+        ]
+        observer = Document("obs", diagnostics=True)
+        observer.merge([ops[3], ops[1], base])
+        observer.merge([ops[0], ops[2], ops[3], base])
+        diag = observer.diagnostics
+        diag.verify(observer)
+        self.assertEqual(diag.replay_text(), observer.text)
+
+    def test_fixed_seed_replay_gives_identical_report(self) -> None:
+        def scenario() -> str:
+            rng = random.Random(20260929)
+            source = Document("src")
+            ops = [source.local_insert(0, "abc")]
+            for _ in range(12):
+                if source.text and rng.random() < 0.4:
+                    start = rng.randrange(len(source.text))
+                    ops.append(source.local_delete(start, start + 1))
+                else:
+                    index = rng.randrange(len(source.text) + 1)
+                    ops.append(source.local_insert(index, rng.choice("xyz")))
+            observer = Document("obs", diagnostics=True)
+            shuffled = ops[:]
+            rng.shuffle(shuffled)
+            observer.merge(shuffled + shuffled[:3])
+            observer.merge(ops)
+            observer.diagnostics.verify(observer)
+            return observer.diagnostics.report()
+
+        self.assertEqual(scenario(), scenario())
+
+    def test_disabled_diagnostics_does_not_change_convergence(self) -> None:
+        alpha, bravo, charlie, base = make_base()
+        ops = [
+            alpha.local_insert(3, "!"),
+            bravo.local_insert(0, "<"),
+            charlie.local_delete(1, 2),
+        ]
+        loud = Document("loud", diagnostics=True)
+        quiet = Document("quiet")
+        for doc in (loud, quiet):
+            doc.merge([ops[2], ops[0], base])
+            doc.merge([ops[1], ops[2], ops[0]])
+        self.assertIsNone(quiet.diagnostics)
+        self.assertIsInstance(loud.diagnostics, SyncDiagnostics)
+        self.assertEqual(loud.text, quiet.text)
+        self.assertEqual(loud.version_vector, quiet.version_vector)
+        loud.diagnostics.verify(loud)
 
 
 if __name__ == "__main__":

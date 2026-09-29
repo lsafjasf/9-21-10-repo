@@ -87,10 +87,140 @@ def allocate_between(left: Position, right: Position, tag: Tag) -> Position:
 POSITION_KEY = cmp_to_key(compare_positions)
 
 
+def _format_op_id(op_id: OpId) -> str:
+    seq, site = op_id
+    return f"{site}#{seq}"
+
+
+class SyncDiagnostics:
+    """Optional per-replica recorder that opens up the causal sync buffer.
+
+    Recording is a pure function of the sequence of ``apply`` calls a replica
+    receives, so replaying the same delivery order (e.g. one produced from a
+    fixed random seed) yields byte-identical reports. Enabling or disabling
+    diagnostics never changes merge results.
+    """
+
+    def __init__(self, site: str) -> None:
+        self.site = site
+        self.received = 0
+        self.events: List[Dict[str, Any]] = []
+        self._applied_ops: List[Dict[str, Any]] = []
+        self._pending_wait: Dict[OpId, Dict[str, int]] = {}
+
+    def record_received(self) -> None:
+        self.received += 1
+
+    def record_applied(self, op: Dict[str, Any], via: str) -> None:
+        op_id = _op_id(op)
+        self._applied_ops.append(op)
+        self._pending_wait.pop(op_id, None)
+        self.events.append({"event": "applied", "op": op_id, "via": via})
+
+    def record_pending(self, op: Dict[str, Any], waiting_for: Dict[str, int]) -> None:
+        op_id = _op_id(op)
+        redelivered = op_id in self._pending_wait
+        self._pending_wait[op_id] = dict(waiting_for)
+        self.events.append(
+            {
+                "event": "pending",
+                "op": op_id,
+                "waiting_for": dict(waiting_for),
+                "redelivered": redelivered,
+            }
+        )
+
+    def record_skipped(self, op: Dict[str, Any], basis: Dict[str, Any]) -> None:
+        self.events.append({"event": "skipped", "op": _op_id(op), "basis": basis})
+
+    def record_dropped(self, op: Dict[str, Any], basis: Dict[str, Any]) -> None:
+        op_id = _op_id(op)
+        self._pending_wait.pop(op_id, None)
+        self.events.append({"event": "dropped", "op": op_id, "basis": basis})
+
+    @property
+    def applied_count(self) -> int:
+        return len(self._applied_ops)
+
+    @property
+    def skipped_count(self) -> int:
+        return sum(1 for event in self.events if event["event"] == "skipped")
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending_wait)
+
+    def currently_pending(self) -> Dict[OpId, Dict[str, int]]:
+        """Buffered operations and the predecessors each is still waiting for."""
+        return {op_id: dict(wait) for op_id, wait in self._pending_wait.items()}
+
+    def replay_text(self) -> str:
+        """Replay the recorded applied operations into a fresh replica."""
+        replica = Document(f"{self.site}-diag-replay")
+        for op in self._applied_ops:
+            status = replica.apply(op)
+            if status != "applied":
+                raise AssertionError(
+                    f"diagnostics replay failed for {_format_op_id(_op_id(op))}: {status}"
+                )
+        return replica.text
+
+    def verify(self, document: "Document") -> None:
+        """Assert the recorded diagnostics agree with the document state."""
+        replayed = self.replay_text()
+        assert replayed == document.text, (
+            f"replica {self.site}: diagnostics replay {replayed!r} "
+            f"!= document text {document.text!r}"
+        )
+        buffered = {_op_id(op) for op in document.pending_operations}
+        assert set(self._pending_wait) == buffered, (
+            f"replica {self.site}: diagnostics pending "
+            f"{sorted(self._pending_wait)} != document pending {sorted(buffered)}"
+        )
+        arrivals = sum(
+            1
+            for event in self.events
+            if event["event"] in ("skipped", "pending")
+            or (event["event"] == "applied" and event["via"] == "direct")
+        )
+        assert arrivals == self.received, (
+            f"replica {self.site}: {arrivals} arrival events "
+            f"!= {self.received} received operations"
+        )
+
+    def report(self) -> str:
+        """Deterministic human-readable summary of the recorded sync trace."""
+        lines = [
+            f"replica {self.site}: received={self.received} "
+            f"applied={self.applied_count} skipped={self.skipped_count} "
+            f"pending={self.pending_count}"
+        ]
+        for index, event in enumerate(self.events, 1):
+            op_id = _format_op_id(event["op"])
+            kind = event["event"]
+            if kind == "applied":
+                detail = f"via={event['via']}"
+            elif kind == "pending":
+                waiting = event["waiting_for"]
+                detail = f"waiting_for={waiting or '{}'}"
+                if event["redelivered"]:
+                    detail += " redelivered"
+            else:
+                detail = f"basis={event['basis']}"
+            lines.append(f"  {index:3d}. {kind:<8} {op_id:<10} {detail}")
+        if self._pending_wait:
+            lines.append("  still waiting:")
+            for op_id in sorted(self._pending_wait):
+                lines.append(
+                    f"    {_format_op_id(op_id)} waits for {self._pending_wait[op_id]}"
+                )
+        return "\n".join(lines)
+
+
 class Document:
     """A replica of a collaborative text document."""
 
-    def __init__(self, site: str) -> None:
+    def __init__(self, site: str, diagnostics: bool = False) -> None:
         if not isinstance(site, str) or not site:
             raise ValueError("site must be a non-empty string")
         self.site = site
@@ -100,6 +230,9 @@ class Document:
         self._applied_log: List[Dict[str, Any]] = []
         self._pending: Dict[OpId, Dict[str, Any]] = {}
         self._lamport = 0
+        self.diagnostics: Optional[SyncDiagnostics] = (
+            SyncDiagnostics(site) if diagnostics else None
+        )
 
     @property
     def text(self) -> str:
@@ -138,6 +271,14 @@ class Document:
             for site, seq in prev.items()
         )
 
+    def _missing_predecessors(self, op: Dict[str, Any]) -> Dict[str, int]:
+        """Predecessor entries of ``op`` not yet covered by the version vector."""
+        return {
+            site: seq
+            for site, seq in op.get("prev", {}).items()
+            if seq > self._version_vector.get(site, 0)
+        }
+
     def _apply_effect(self, op: Dict[str, Any]) -> None:
         kind = op["type"]
         if kind == "ins":
@@ -162,17 +303,30 @@ class Document:
 
     def _drain_pending(self) -> int:
         applied = 0
+        diag = self.diagnostics
         while True:
             progressed = False
             for op_id in sorted(self._pending):
                 op = self._pending[op_id]
                 if op["seq"] <= self._version_vector.get(op["site"], 0):
                     del self._pending[op_id]
+                    if diag is not None:
+                        diag.record_dropped(
+                            op,
+                            {
+                                "kind": "already_applied",
+                                "site": op["site"],
+                                "op_seq": op["seq"],
+                                "vv_seq": self._version_vector.get(op["site"], 0),
+                            },
+                        )
                     progressed = True
                     break
                 if self._is_ready(op):
                     del self._pending[op_id]
                     self._apply_effect(op)
+                    if diag is not None:
+                        diag.record_applied(op, via="drain")
                     applied += 1
                     progressed = True
                     break
@@ -183,14 +337,31 @@ class Document:
         """Apply one operation and return applied, pending, or skipped."""
         op = _tuplify(raw_op)
         op_id = _op_id(op)
+        diag = self.diagnostics
+        if diag is not None:
+            diag.record_received()
         site_seq = self._version_vector.get(op["site"], 0)
         if op["seq"] <= site_seq:
+            if diag is not None:
+                diag.record_skipped(
+                    op,
+                    {
+                        "kind": "already_applied",
+                        "site": op["site"],
+                        "op_seq": op["seq"],
+                        "vv_seq": site_seq,
+                    },
+                )
             return "skipped"
         if not self._is_ready(op):
+            if diag is not None:
+                diag.record_pending(op, self._missing_predecessors(op))
             self._pending[op_id] = op
             return "pending"
 
         self._apply_effect(op)
+        if diag is not None:
+            diag.record_applied(op, via="direct")
         self._drain_pending()
         return "applied"
 
@@ -275,9 +446,10 @@ class Document:
         cls,
         snapshot: Dict[str, Any],
         site: Optional[str] = None,
+        diagnostics: bool = False,
     ) -> "Document":
         snap = _tuplify(snapshot)
-        doc = cls(site or snap["site"])
+        doc = cls(site or snap["site"], diagnostics=diagnostics)
         doc._version_vector = dict(snap["vv"])
         doc._chars = {
             char["id"]: {"id": char["id"], "pos": char["pos"], "ch": char["ch"]}
